@@ -1,0 +1,6 @@
+# Only needed for rips whose subtitles are images (Blu-ray PGS / DVD VobSub),
+# i.e. rips with no embedded text subtitle track.
+# Also requires the tesseract binary: `brew install tesseract` (macOS) or
+# `sudo apt install tesseract-ocr` (Debian/Ubuntu).
+pillow
+pytesseract
