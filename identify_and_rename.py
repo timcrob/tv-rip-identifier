@@ -168,21 +168,37 @@ def build_refs(subs_root, season):
 
 
 def sub_streams(path):
+    """Return (subrip_abs, image_abs, image_rel): absolute stream index of the
+    English text (subrip) track, absolute index of the English image track, and
+    the image track's index *among subtitle streams only* (the N in ffmpeg 0:s:N,
+    which the OCR overlay filter needs)."""
     r = sh(["ffprobe", "-v", "error", "-select_streams", "s",
             "-show_entries", "stream=index,codec_name:stream_tags=language",
             "-of", "csv=p=0", path])
-    subrip, image = None, None
+    subrip, image, image_rel = None, None, None
+    rel = -1
     for line in r.stdout.splitlines():
         p = line.split(",")
         if len(p) < 2:
             continue
+        rel += 1
         idx, codec = int(p[0]), p[1].strip()
         lang = p[2].strip() if len(p) > 2 else ""
         if codec == "subrip" and subrip is None and lang in ("eng", "en", ""):
             subrip = idx
         elif codec in ("dvd_subtitle", "hdmv_pgs_subtitle") and image is None and lang in ("eng", "en", ""):
-            image = idx
-    return subrip, image
+            image, image_rel = idx, rel
+    return subrip, image, image_rel
+
+
+def video_dims(path):
+    r = sh(["ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=width,height", "-of", "csv=p=0", path])
+    try:
+        w, h = r.stdout.strip().split(",")[:2]
+        return int(w), int(h)
+    except Exception:
+        return 1280, 720
 
 
 def runtime_sec(path):
@@ -197,34 +213,67 @@ def runtime_sec(path):
 def extract_subrip(path, idx):
     with tempfile.NamedTemporaryFile(suffix=".srt", delete=False) as tf:
         tmp = tf.name
-    sh(["ffmpeg", "-y", "-v", "error", "-i", path, "-map", f"0:{idx}", "-c:s", "srt", tmp])
+    # -threads 4 avoids a demux hang some MKVs hit on subtitle extraction.
+    try:
+        subprocess.run(["ffmpeg", "-y", "-v", "error", "-threads", "4",
+                        "-i", path, "-map", f"0:{idx}", "-c:s", "srt", tmp],
+                       capture_output=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        pass
     txt = read_srt(tmp)
-    os.unlink(tmp)
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
     return txt
 
 
-def ocr_sample(path, image_idx, start, dur, fps):
+def ocr_sample(path, image_rel, start, dur, fps):
+    """OCR the image subtitle by rendering it onto a BLACK canvas (crisp
+    white-on-black, no video clutter), de-duping identical frames, and reading
+    each with tesseract. Input-seek (`-ss start`) windows the sample so a late
+    window can identify the second half of a two-part episode."""
     try:
         from PIL import Image
         import pytesseract
     except ImportError:
         return "", "NO_OCR_DEPS"
+    if image_rel is None:
+        return "", "ocr"
+    import hashlib
+    W, H = video_dims(path)
     d = tempfile.mkdtemp()
-    vf = (f"[0:v]trim=start={start}:duration={dur},setpts=PTS-STARTPTS[v];"
-          f"[0:{image_idx}]trim=start={start}:duration={dur},setpts=PTS-STARTPTS[s];"
-          f"[v][s]overlay[c];[c]scale=1280:-2[o]")
-    sh(["ffmpeg", "-y", "-v", "error", "-copyts", "-i", path,
-        "-filter_complex", vf, "-map", "[o]", "-r", str(fps),
-        os.path.join(d, "f%05d.png")])
-    words = []
+    vf = f"[0:s:{image_rel}]setpts=PTS-STARTPTS[s];[1:v][s]overlay=shortest=1[o]"
+    try:
+        subprocess.run(["ffmpeg", "-y", "-v", "error",
+                        "-ss", str(start), "-i", path,
+                        "-f", "lavfi", "-t", str(dur), "-i", f"color=c=black:s={W}x{H}",
+                        "-filter_complex", vf, "-map", "[o]", "-r", str(fps),
+                        os.path.join(d, "f_%05d.png")],
+                       capture_output=True, timeout=1800)
+    except subprocess.TimeoutExpired:
+        pass
+    texts, last = [], None
     for fn in sorted(os.listdir(d)):
+        fp = os.path.join(d, fn)
         try:
-            words.append(pytesseract.image_to_string(Image.open(os.path.join(d, fn))))
+            im = Image.open(fp).convert("L")
+            if sum(im.histogram()[200:]) >= 40:          # frame has bright (text) pixels
+                h = hashlib.md5(im.tobytes()).hexdigest()
+                if h != last:                            # skip repeats of the same subtitle
+                    last = h
+                    im2 = im.point(lambda p: 255 if p > 140 else 0)
+                    t = pytesseract.image_to_string(im2, config="--psm 6")
+                    if t.strip():
+                        texts.append(t)
         except Exception:
             pass
-        os.unlink(os.path.join(d, fn))
+        try:
+            os.unlink(fp)
+        except OSError:
+            pass
     os.rmdir(d)
-    return re.sub(r"[^a-z0-9 ]", " ", " ".join(words).lower()), "ocr"
+    return re.sub(r"[^a-z0-9 ]", " ", " ".join(texts).lower()), "ocr"
 
 
 def get_transcript(path, cache, args, start=None, dur=None, suffix=""):
@@ -238,11 +287,11 @@ def get_transcript(path, cache, args, start=None, dur=None, suffix=""):
     mp = os.path.join(cache, base + suffix + ".method")
     if os.path.exists(cp):
         return read_txt(cp), (open(mp).read().strip() if os.path.exists(mp) else "cache")
-    subrip, image = sub_streams(path)
+    subrip, image, image_rel = sub_streams(path)
     if subrip is not None:
         txt, method = extract_subrip(path, subrip), "subrip"
     elif image is not None and not args.no_ocr:
-        txt, method = ocr_sample(path, image, start, dur, args.fps)
+        txt, method = ocr_sample(path, image_rel, start, dur, args.fps)
     else:
         txt, method = "", ("NO_OCR_DEPS" if image is not None else "NO_SUBS")
     if len(txt) >= 100:
@@ -260,6 +309,17 @@ def windows(text, n=6):
 def score(qs, refs):
     return sorted(((k, sum(1 for w in qs if w in v[1])) for k, v in refs.items()),
                   key=lambda x: -x[1])
+
+
+def is_confident(hits, second, words, method, args):
+    """Accept a match when it clears the hit floor and either beats the runner-up
+    by 2x or is decisive on its own (strong-hits). For OCR, also require a minimum
+    hits/words ratio so garbage transcripts can't win by luck."""
+    if hits < args.min_hits:
+        return False
+    if method != "subrip" and words and (hits / words) < args.min_ratio:
+        return False
+    return hits >= 2 * max(second, 1) or hits >= args.strong_hits
 
 
 def check_env(root, subs_root):
@@ -296,6 +356,10 @@ def main():
     ap.add_argument("--dur", type=int, default=240, help="OCR sample length (sec)")
     ap.add_argument("--fps", type=float, default=1.0, help="OCR sample frames/sec")
     ap.add_argument("--min-hits", type=int, default=8, help="min dialogue hits to accept")
+    ap.add_argument("--min-ratio", type=float, default=0.12, dest="min_ratio",
+                    help="min (hits / OCR-words) ratio to accept an OCR match")
+    ap.add_argument("--strong-hits", type=int, default=40, dest="strong_hits",
+                    help="hit count that confirms a match regardless of the runner-up")
     ap.add_argument("--span-ratio", type=float, default=1.55,
                     help="a rip this many times the season's median runtime is treated "
                          "as a possible multi-part episode")
@@ -335,8 +399,8 @@ def main():
             txt, method = get_transcript(path, cache, args)
             scored = score(windows(txt), refs) if len(txt) >= 100 else []
             recs.append({"path": path, "file": os.path.basename(path), "txt_len": len(txt),
-                         "method": method, "scored": scored, "rt": runtime_sec(path),
-                         "dt": time.time() - t0})
+                         "words": len(txt.split()), "method": method, "scored": scored,
+                         "rt": runtime_sec(path), "dt": time.time() - t0})
         rts = [r["rt"] for r in recs if r["rt"] > 0]
         median = statistics.median(rts) if rts else 0
 
@@ -352,7 +416,7 @@ def main():
             (ss, se), shh = (scored[1][0], scored[1][1]) if len(scored) > 1 else ((0, 0), 0)
             is_long = median and r["rt"] >= args.span_ratio * median
             nums = None
-            if is_long and bh >= args.min_hits:
+            if is_long and is_confident(bh, 0, r["words"], method, args):
                 nums = [be]
                 other = None
                 if method == "subrip":
@@ -363,14 +427,15 @@ def main():
                     # OCR only saw the early window: sample a late window for part 2
                     late = int(r["rt"] * 0.62)
                     txt2, _ = get_transcript(path, cache, args, start=late, dur=args.dur, suffix=".late")
+                    w2 = len(txt2.split())
                     sc2 = score(windows(txt2), refs) if len(txt2) >= 100 else []
-                    if sc2 and sc2[0][1] >= args.min_hits and sc2[0][0][1] != be \
-                            and abs(sc2[0][0][1] - be) == 1:
+                    if sc2 and is_confident(sc2[0][1], 0, w2, method, args) \
+                            and sc2[0][0][1] != be and abs(sc2[0][0][1] - be) == 1:
                         other = sc2[0][0][1]
                 if other:
                     nums = sorted([be, other])
                 status = "MATCH"
-            elif bh >= args.min_hits and bh >= 2 * max(shh, 1):
+            elif is_confident(bh, shh, r["words"], method, args):
                 nums = [be]
                 status = "MATCH"
             else:

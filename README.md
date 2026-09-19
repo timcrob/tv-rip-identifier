@@ -20,12 +20,15 @@ For each `Season N` folder, it builds a reference index from your `Subtitles/` f
 then for every rip:
 
 1. Extracts an embedded **text** subtitle track if the rip has one (fast).
-2. Otherwise **OCRs** the image subtitle (Blu-ray PGS / DVD VobSub) over a short sample.
+2. Otherwise **OCRs** the image subtitle (Blu-ray PGS / DVD VobSub) by rendering each
+   subtitle onto a black canvas — crisp white-on-black, no video behind it — de-duping
+   repeated frames and reading them with tesseract over a short sample.
 3. Chops that dialogue into overlapping 6-word phrases and counts how many appear
    verbatim in each candidate episode's reference subtitle.
-4. The episode with by far the most matches wins. A match is only accepted when the
-   best score is at least `--min-hits` (default 8) **and** at least double the
-   runner-up — otherwise the file is treated as unidentified.
+4. The episode with by far the most matches wins. A match is accepted when it clears
+   `--min-hits` (default 8) and either beats the runner-up 2× or is decisive on its own
+   (`--strong-hits`); OCR matches must also clear a hits/words ratio (`--min-ratio`).
+   Anything short of that is treated as unidentified.
 
 Transcripts are cached under `<show>/.idcache/`, so re-runs and the `--apply` pass
 never repeat the slow OCR.
@@ -103,6 +106,8 @@ unidentified) and `id_results.json`. **Always review the dry-run before `--apply
 | `--dur N` | `240` | OCR sample length, seconds |
 | `--fps F` | `1.0` | OCR sample frame rate |
 | `--min-hits N` | `8` | minimum dialogue hits to accept a match |
+| `--min-ratio F` | `0.12` | minimum hits / OCR-words ratio to accept an OCR match (guards against garbage OCR) |
+| `--strong-hits N` | `40` | hit count that confirms a match even if a neighbor shares a lot of dialogue |
 
 ## Reading the output
 
