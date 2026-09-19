@@ -1,5 +1,7 @@
 # tv-rip-identifier
 
+> Written by Claude (Opus 4.8), Anthropic's AI model, in collaboration with the repo owner.
+
 Identify unlabeled TV episode rips by their **subtitle dialogue** and rename them to
 `SxxEyy - Title.mkv`.
 
